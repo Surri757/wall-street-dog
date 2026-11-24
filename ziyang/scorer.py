@@ -510,6 +510,10 @@ def _netbuy_calendar() -> dict[str, set]:
             df = pd.read_csv(path, dtype={"股票代码": str}, encoding="utf-8-sig")
             df["交易日期"] = pd.to_datetime(df["交易日期"]).dt.strftime("%Y-%m-%d")
             frames.append(df)
+    if not frames:
+        # 明细尚未拉取（新克隆、或还没跑过 update/daily_sync）：没有标签可算。
+        # 此前空列表直接 concat 会抛「No objects to concatenate」
+        return {}
     df = pd.concat(frames, ignore_index=True)
     g = (df.groupby(["交易日期", "股票代码"], as_index=False)
          .agg(买=("买入金额", "max"), 卖=("卖出金额", "max")))
