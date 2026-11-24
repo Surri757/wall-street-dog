@@ -1,0 +1,22 @@
+# ruff 基线（2026-11-24 第三轮质量）。只开「会咬人」的规则族，全仓保持零告警：
+#   F       pyflakes：未用导入/变量、未定义名——真实缺陷的主要来源
+#   E9      语法错误
+#   ARG     未用参数：签名漂移的信号（调用方多传一个参数会被 try/except 吞掉，
+#           见 vane.model_rank_key 事故：测试改了、生产调用点没改，静默回退启发式）
+#   SIM115  文件句柄不走 with：Windows 上句柄未释放会让原子替换偶发失败
+#   PLW1510 subprocess 不检查退出码（「失败被报成成功」事故）
+# 运行：python -m ruff check .
+target-version = "py311"
+exclude = ["out", ".mimosa", "私人搜索结果"]
+
+[lint]
+select = ["F", "E9", "ARG", "SIM115", "PLW1510"]
+
+[lint.per-file-ignores]
+# 门面/再导出模块：导入即导出，未用导入是有意的
+"data_source.py" = ["F401"]
+"calib/__init__.py" = ["F401"]
+"calibrate.py" = ["F401"]
+# 测试里的替身函数必须与被替身者同签名，参数未用是常态；断言中顺手
+# `open(p).read()` 读临时文件不持有句柄，不强制 with
+"tests/*" = ["ARG", "SIM115"]

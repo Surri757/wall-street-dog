@@ -1,0 +1,24 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.benchmarks/
+.venv/
+venv/
+
+# ---------- 运行时数据：全部由程序自己生成，不入库 ----------
+# out/ = 滚动缓存、每日信号归档、各类预注册台账、模型工件、研究缓存与快照。
+# 克隆后跑起来自动积累；作者本机积累的数据不属于开源内容。
+out/
+out_dbg/
+*.log
+
+# ---------- 本地工具与会话状态 ----------
+.zcode/
+.mimosa/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+nul

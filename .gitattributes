@@ -1,0 +1,10 @@
+# 按内容自动识别文本并统一行尾
+* text=auto
+
+# Windows 启动器必须是 CRLF，否则 cmd / schtasks 解析失败
+*.bat text eol=crlf
+
+# 源码与文档统一 LF
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
