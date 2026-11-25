@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
+import fstore
 
 from config import EXCLUDE_ST, MAIN_BOARD_PREFIXES
 from .http import (EM_HEADERS, EM_POOL_BASE, EmptyDataError, _http_get_json,
@@ -264,12 +267,75 @@ def fill_industry_local(cands: list[dict], extras: dict[str, dict],
 _POOL_MEMO: dict = {}   # 进程内池缓存：同一 (kind, date) 只拉一次。
                         # mood 序列/fetch_pool_extras/backfill 会重复请求相同日期的池。
 
+# 池本地存档：<kind>_<date>.json。东财历史池有两个坑，都靠它兜——
+# ① 在线只保留约 3 周；② 阵发性地返回不完整的旧快照：2026-11-25 实测 11-19 有
+#   20% 的请求只有 17/23 行（少的是尾盘才封板的票），几分钟后又恢复。每次运行新建
+#   连接落到哪台服务器、赶上哪个时段是随机的，所以同一晚两次运行算出的连板数会
+#   不一样（当晚盛剑科技因此少了一个板、被当成 5 板进了风向标名单）。
+# 每个观测版本与存档取「最完整的一致版本」，存档只增不减：之后任何一次不完整的
+# 在线结果都会被存档补全。
+POOL_ARCHIVE = os.path.join("out", "archive", "pools")
+_POOL_PATHS = {"zt": "/getTopicZTPool", "zb": "/getTopicZBPool"}
+_POOL_RECHECK = 3        # 在线行数不足响应自报总数时，最多换新连接重取几次
 
-def pool_raw(kind: str, date: str):
-    key = (kind, date)
-    if key in _POOL_MEMO:
-        return _POOL_MEMO[key]
-    paths = {"zt": "/getTopicZTPool", "zb": "/getTopicZBPool"}
+
+def _pool_code(row) -> str:
+    """池行的代码键（兼容新 dict / 旧位置数组两种行格式）。"""
+    if isinstance(row, dict):
+        return str(row.get("c", "")).strip()
+    return str(row[0]).strip() if isinstance(row, (list, tuple)) and row else ""
+
+
+def _pool_codes(rows) -> set:
+    return {_pool_code(r) for r in rows or []} - {""}
+
+
+def _widest(*versions) -> tuple[list, bool]:
+    """多个版本 → (最完整的一致版本, 是否出现互相矛盾的版本)。
+
+    以行数最多的版本为基准；别的版本只有是它的子集（被截断的旧快照）或超集
+    （更全）时才影响结果。互不包含的版本不合并——那不是截断，不能替用户猜哪边对
+    ——只取行数多的那个并把矛盾标出来，由调用方决定是否留痕、是否更新存档。
+    """
+    best, conflict = [], False
+    for rows in versions:
+        if not rows:
+            continue
+        if not best:
+            best = rows
+            continue
+        a, b = _pool_codes(best), _pool_codes(rows)
+        if a <= b:
+            best = rows                     # rows 是基准的超集（或与之相同）
+        elif not (b <= a):
+            conflict = True                 # 各有对方没有的票：不合并
+            if len(b) > len(a):
+                best = rows                 # 只取行数多的
+    return list(best), conflict
+
+
+def _archive_path(kind: str, date: str) -> str:
+    return os.path.join(POOL_ARCHIVE, f"{kind}_{date}.json")
+
+
+def _load_pool_archive(kind: str, date: str) -> list:
+    got = fstore.read_json(_archive_path(kind, date))
+    return got if isinstance(got, list) else []
+
+
+def _is_intraday(date: str) -> bool:
+    """date 是今天且未到收盘缓冲：此刻的池是盘中状态，不能当收盘结果存档。"""
+    from config import AFTER_CLOSE_BUFFER_MINUTES
+    try:
+        d = dt.datetime.strptime(date, "%Y%m%d").date()
+    except ValueError:
+        return False
+    return d == dt.date.today() and dt.datetime.now().time() < dt.time(
+        15, AFTER_CLOSE_BUFFER_MINUTES)
+
+
+def _fetch_pool(kind: str, date: str, fresh: bool = False):
+    """单次请求 → (原始行 | None, 响应自报总数 tc | None, 失败原因)。"""
     params = {
         "ut": "7eea3edcaed734bea9cbfc24409ed989",
         "dpt": "wz.ztzt",
@@ -279,23 +345,77 @@ def pool_raw(kind: str, date: str):
         "date": date,
     }
     try:
-        data = _http_get_json(EM_POOL_BASE + paths[kind], params,
+        data = _http_get_json(EM_POOL_BASE + _POOL_PATHS[kind], params,
                               referer="https://quote.eastmoney.com/ztb/detail",
-                              timeout=6)
-        pool = data.get("pool") or []
-        result = pool if isinstance(pool, list) else None
+                              timeout=6, retries=1 if fresh else None, fresh=fresh)
     except EmptyDataError:
-        # 接口明确答复无该日数据（非交易日 / 超出保留期）：预期内，不刷屏
-        result = None
+        # 接口明确答复无该日数据（非交易日 / 超出保留期）
+        return None, None, "nodata"
     except Exception as e:                       # noqa: BLE001 真故障要留痕
-        result = None
-        print(f"  [提示] {kind}池 {date} 拉取失败（{type(e).__name__}），"
-              f"该日按缺池处理")
-    # 失败(None)不进 memo：瞬时断连若被进程级永久缓存，mood 多日循环中该日
-    # 会永远判空且无重试机会；空池([]) 是合法交易日结果，照常缓存。
-    if result is not None:
-        _POOL_MEMO[key] = result
-    return result
+        return None, None, type(e).__name__
+    pool = data.get("pool") if isinstance(data, dict) else None
+    if not isinstance(pool, list):
+        return None, None, "format"
+    tc = data.get("tc")
+    tc = int(tc) if isinstance(tc, int) or (isinstance(tc, str) and tc.isdigit()) else None
+    return pool, tc, ""
+
+
+def pool_raw(kind: str, date: str):
+    """取某日某池的原始行（新 dict / 旧数组格式原样）；失败返回 None。
+
+    稳定性设计（缘由见 POOL_ARCHIVE 注释）：
+    - 行数不足响应自报的总数 tc → 换一条新连接重取（最多 _POOL_RECHECK 次）；
+    - 某日第一次落存档时，额外用新连接取一次做独立观测；
+    - 与本地存档合并（只增不减）：在线名单比存档少 = 疑似旧快照，按存档补全并提示；
+      互相矛盾则不更新存档、照实提示；
+    - 在线取不到（断连 / 超出保留期）时用存档；
+    - 当天盘中的运行既不读也不写存档（预览），收盘后照常。
+    失败且无存档返回 None；空池（[]）是合法结果。
+    """
+    key = (kind, date)
+    if key in _POOL_MEMO:
+        return _POOL_MEMO[key]
+    live = _is_intraday(date)
+    stored = [] if live else _load_pool_archive(kind, date)
+    rows, tc, err = _fetch_pool(kind, date)
+    if rows is None:
+        if stored:
+            print(f"  [提示] {kind}池 {date} 在线不可用（{err}），改用本地存档"
+                  f"（{len(stored)} 行）")
+            _POOL_MEMO[key] = stored
+            return stored
+        if err != "nodata":                   # 预期内的「无该日数据」不刷屏
+            print(f"  [提示] {kind}池 {date} 拉取失败（{err}），该日按缺池处理")
+        return None
+    if not live and not stored:
+        extra, _, _ = _fetch_pool(kind, date, fresh=True)
+        rows, _ = _widest(rows, extra)
+    for _ in range(0 if live else _POOL_RECHECK):   # 盘中预览不追完整
+        if tc is None or len(rows) >= tc:
+            break
+        extra, _, _ = _fetch_pool(kind, date, fresh=True)
+        before = len(rows)
+        rows, _ = _widest(rows, extra)
+        if len(rows) == before:
+            break                             # 新连接也没带来更多票，不再白等
+    merged, conflict = _widest(rows, stored)
+    n_rows, n_stored = len(_pool_codes(rows)), len(_pool_codes(stored))
+    if n_rows < n_stored:
+        print(f"  [涨停池] {kind} {date} 在线名单 {n_rows} 行少于本地存档 {n_stored} 行"
+              f"（疑似返回了旧快照），已按存档补全为 {len(_pool_codes(merged))} 行")
+    if conflict:
+        print(f"  [涨停池⚠] {kind} {date} 在线名单与本地存档互相矛盾"
+              f"（在线 {n_rows} 行 / 存档 {n_stored} 行），本次未更新存档")
+    elif not live and len(_pool_codes(merged)) > n_stored:
+        fstore.write_json(_archive_path(kind, date), merged)
+    if tc is not None and len(_pool_codes(merged)) < tc:
+        print(f"  [涨停池⚠] {kind} {date} 名单不完整：{len(_pool_codes(merged))}/{tc} 行"
+              f"（多次重取仍未取全），该日连板数可能被低估")
+    # 成功结果进 memo（空池 [] 也是合法结果）。失败不进：瞬时断连若被进程级永久
+    # 缓存，mood 多日循环中该日会永远判空且无重试机会
+    _POOL_MEMO[key] = merged
+    return merged
 
 
 def _prev_trade_date(trade_date: dt.date,

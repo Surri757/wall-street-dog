@@ -67,16 +67,21 @@ class EmptyDataError(ValueError):
 
 
 def _http_get_json(url: str, params: dict, referer: str, timeout: int = 6,
-                   retries: int = None) -> dict:
-    """GET + JSON 解析，带重试（FETCH_RETRIES 次，间隔 FETCH_SLEEP 秒）。"""
+                   retries: int = None, fresh: bool = False) -> dict:
+    """GET + JSON 解析，带重试（FETCH_RETRIES 次，间隔 FETCH_SLEEP 秒）。
+
+    fresh=True 用一条全新连接发请求（不复用共享会话）：东财部分接口在不同连接
+    上会返回不同版本的历史数据（见 pools.pool_raw），换连接才算一次独立观测。
+    """
     from config import FETCH_RETRIES, FETCH_SLEEP
     if retries is None:
         retries = FETCH_RETRIES
     headers = dict(EM_HEADERS, Referer=referer)
+    session = requests.Session() if fresh else _SESSION
     last_err = None
     for attempt in range(max(1, retries)):
         try:
-            r = _SESSION.get(url, params=params, headers=headers, timeout=timeout)
+            r = session.get(url, params=params, headers=headers, timeout=timeout)
             r.raise_for_status()
             j = r.json()
             data = j.get("data")

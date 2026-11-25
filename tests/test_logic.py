@@ -777,24 +777,26 @@ def test_calibrate_features():
     f6 = calibrate.build_features(dict(r2, date="2026-08-28"))   # 周五推导
     assert f6["周五"] and not f6["周四"]
 
-    # _pool_raw 进程内记忆化：同 (kind,date) 二次调用不再发请求
+    # pool_raw 进程内记忆化：同 (kind,date) 二次调用不再发请求
+    # （某日首次落存档时会用新连接多取一次做独立观测，所以每个新日期是 2 次请求）
     import datasources.pools as pools_mod
     calls = {"n": 0}
     orig_http = pools_mod._http_get_json
 
-    def fake_http(url, params, referer, timeout=6, retries=None):
+    def fake_http(url, params, referer, timeout=6, retries=None, fresh=False):
         calls["n"] += 1
         return {"pool": [{"c": "600000", "n": "x", "p": 10000, "hs": 1, "lbc": 2,
-                          "fbt": 93000, "hybk": "T", "zdp": 10, "amount": 1}]}
+                          "fbt": 93000, "hybk": "T", "zdp": 10, "amount": 1}],
+                "tc": 1}
 
     pools_mod._http_get_json = fake_http
     pools_mod._POOL_MEMO.clear()
     try:
         a1 = pools_mod._pool_raw("zt", "20260901")
         a2 = pools_mod._pool_raw("zt", "20260901")
-        assert a1 is a2 and calls["n"] == 1          # 命中记忆，未重复请求
+        assert a1 is a2 and calls["n"] == 2          # 命中记忆，未重复请求
         pools_mod._pool_raw("zt", "20260902")
-        assert calls["n"] == 2
+        assert calls["n"] == 4
     finally:
         pools_mod._http_get_json = orig_http
         pools_mod._POOL_MEMO.clear()
@@ -3435,6 +3437,83 @@ def test_round3_pools_backfill_research_stats():
     print("PASS round3 pools/backfill/research/stats")
 
 
+def test_pool_raw_stale_snapshot():
+    """涨停/炸板池取数稳定性（2026-11-25 实测：东财历史池阵发性返回不完整的旧快照，
+    同一晚两次运行算出的连板数不同）：行数不足自报总数 → 换新连接重取；本地存档
+    只增不减、补全旧快照、在线不可用时兜底；互相矛盾的版本不合并；当天盘中不读不写存档。"""
+    import shutil
+    import tempfile
+
+    import datasources.pools as P
+
+    def row(c):
+        return {"c": c, "n": "票" + c[-2:], "lbc": 1}
+
+    tmp = tempfile.mkdtemp()
+    keep = (P.POOL_ARCHIVE, P._http_get_json, P._is_intraday)
+    P.POOL_ARCHIVE = os.path.join(tmp, "pools")
+    P._is_intraday = lambda date: False
+    script: list = []            # 每次请求的返回内容，按调用顺序弹出
+    log: list = []               # 每次请求是否用了新连接
+
+    def fake(url, params, referer, timeout=6, retries=None, fresh=False):
+        log.append("fresh" if fresh else "reuse")
+        item = script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    P._http_get_json = fake
+    try:
+        full = {"pool": [row("600001"), row("600002"), row("600003")], "tc": 3}
+        cut = {"pool": [row("600001")], "tc": 3}      # 旧快照：漏了尾盘封板的两只
+        # ① 某日首次落存档：行数不足 tc → 换新连接重取 → 取全 → 存档
+        script[:] = [cut, full]
+        P._POOL_MEMO.clear()
+        got = P.pool_raw("zt", "20261119")
+        assert [r["c"] for r in got] == ["600001", "600002", "600003"]
+        assert log == ["reuse", "fresh"]
+        assert len(P._load_pool_archive("zt", "20261119")) == 3
+        # ② 存档在，在线又给了旧快照（连自报总数都跟着错）→ 按存档补全，不多发请求
+        script[:] = [{"pool": [row("600001")], "tc": 1}]
+        P._POOL_MEMO.clear()
+        assert len(P.pool_raw("zt", "20261119")) == 3 and len(log) == 3
+        # ③ 在线更全（数据补全）→ 存档增长
+        script[:] = [{"pool": [row(c) for c in ("600001", "600002", "600003", "600004")],
+                      "tc": 4}]
+        P._POOL_MEMO.clear()
+        assert len(P.pool_raw("zt", "20261119")) == 4
+        # ④ 互相矛盾（各有对方没有的票）→ 用行数多的存档，存档不动
+        script[:] = [{"pool": [row("600001"), row("600009")], "tc": 2}]
+        P._POOL_MEMO.clear()
+        assert len(P.pool_raw("zt", "20261119")) == 4
+        assert len(P._load_pool_archive("zt", "20261119")) == 4
+        # ⑤ 在线不可用（断连 / 超出保留期）→ 用存档；没有存档才是缺池（None）
+        script[:] = [ConnectionError("boom")]
+        P._POOL_MEMO.clear()
+        assert len(P.pool_raw("zt", "20261119")) == 4
+        script[:] = [P.EmptyDataError("no data")]
+        P._POOL_MEMO.clear()
+        assert P.pool_raw("zt", "20261030") is None
+        # ⑥ 空池是合法结果（照常记忆，二次调用不再请求）
+        script[:] = [{"pool": [], "tc": 0}, {"pool": [], "tc": 0}]
+        P._POOL_MEMO.clear()
+        assert P.pool_raw("zb", "20261119") == []
+        n = len(log)
+        assert P.pool_raw("zb", "20261119") == [] and len(log) == n
+        # ⑦ 当天盘中：预览——不追完整、不读不写存档
+        P._is_intraday = lambda date: True
+        script[:] = [{"pool": [row("600001")], "tc": 3}]
+        P._POOL_MEMO.clear()
+        assert len(P.pool_raw("zt", "20261125")) == 1 and len(log) == n + 1
+        assert not os.path.exists(os.path.join(P.POOL_ARCHIVE, "zt_20261125.json"))
+    finally:
+        P.POOL_ARCHIVE, P._http_get_json, P._is_intraday = keep
+        P._POOL_MEMO.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS pool raw stale snapshot")
+
+
 def test_round3_auction_report_gates():
     """竞价报告：缺失值不进对照组；配对日不足只报样本量、不落否决；m=3。"""
     import auction as A
@@ -3823,6 +3902,9 @@ if __name__ == "__main__":
     import vane.screen as _VS
     _VC.TURNOVER_DIR = _tf.mkdtemp(prefix="zc_vane_turn_")
     _VS.daily_turnover = lambda *a, **k: {}
+    # 池本地存档同理：测试里一切的 pool_raw 落档都进临时目录，不污染真实存档
+    import datasources.pools as _P
+    _P.POOL_ARCHIVE = _tf.mkdtemp(prefix="zc_pool_archive_")
     test_main_board()
     test_limit_prices()
     test_build_candidates()
@@ -3891,6 +3973,7 @@ if __name__ == "__main__":
     test_round3_cache_and_bars_guards()
     test_round3_kline_sources()
     test_round3_pools_backfill_research_stats()
+    test_pool_raw_stale_snapshot()
     test_round3_auction_report_gates()
     test_round3_vane_model_space()
     test_round3_ziyang_guards()
