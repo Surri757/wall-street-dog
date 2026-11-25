@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+from collections import Counter
 
 import fstore
 import pandas as pd
@@ -77,6 +78,35 @@ def _union_ignition_codes() -> dict[str, set]:
     return out
 
 
+def _rolling_tag_unions(ev: pd.DataFrame) -> dict:
+    """(date, code, win) → 当日以前 win 自然日内的历史标签并集。
+
+    原实现为「每个交易日 × 每个窗口 × 每只当日股票」反复过滤整张事件表，
+    复杂度随事件数平方增长。按 code 分组、按日期升序遍历并用 Counter 增量维护
+    标签覆盖，每个历史事件只进入/离开窗口一次；输出键与值保持原口径。
+    """
+    out = {}
+    for code, grp in ev.groupby("code", sort=False):
+        dates = grp["date"].tolist()
+        tags = grp["tags"].tolist()
+        for win in _WINDOWS:
+            counts = Counter()
+            left = 0
+            for i, d in enumerate(dates):
+                if i:
+                    for tag in tags[i - 1]:
+                        counts[tag] += 1
+                lo = (dt.date.fromisoformat(d) - dt.timedelta(days=win)).isoformat()
+                while left < i and dates[left] < lo:
+                    for tag in tags[left]:
+                        counts[tag] -= 1
+                        if counts[tag] <= 0:
+                            del counts[tag]
+                    left += 1
+                out[(d, code, win)] = set(counts)
+    return out
+
+
 def build_features() -> str:
     """全量重算题材特征表（训练/推理共读；重训前调用一次）。"""
     ev = _build_ths_events()
@@ -86,10 +116,9 @@ def build_features() -> str:
     # 标签 lift 图：date → {tag: 收缩 lift}，只用 date 以前窗口内的点火标签频次
     ev["tags"] = ev["reason_type"].fillna("").map(
         lambda s: [t for t in str(s).split("+") if t]) if "reason_type" in ev else [[]] * len(ev)
+    history_tags = _rolling_tag_unions(ev)
     rows = []
-    dates = sorted(ev["date"].unique())
-    for d in dates:
-        de = ev[ev["date"] == d]
+    for d, de in ev.groupby("date", sort=True):
         # 基线：当日涨停池全体标签频
         base: dict[str, int] = {}
         for tags in de["tags"]:
@@ -107,15 +136,10 @@ def build_features() -> str:
                     pos[t] = pos.get(t, 0) + 1
         lifts = {t: (pos.get(t, 0) + 0.0) / (base[t] * max(n_pos, 1) / max(n_base, 1) + _K)
                  for t in base} if n_pos else {}
-        # 滚动窗口特征（只往前看）
-        d_dt = dt.date.fromisoformat(d)
+        # 滚动窗口特征（只往前看）：标签并集已按 code 增量预计算，查表即可。
         for win in _WINDOWS:
-            lo = (d_dt - dt.timedelta(days=win)).isoformat()
-            hist = ev[(ev["date"] >= lo) & (ev["date"] < d)]
             for code in de["code"]:
-                tags90 = set()
-                for t in hist[hist["code"] == code]["tags"]:
-                    tags90 |= set(t)
+                tags90 = history_tags.get((d, code, win), set())
                 if not tags90:
                     rows.append({"date": d, "code": code, "win": win, "val": 0.0})
                     continue

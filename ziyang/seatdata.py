@@ -952,10 +952,18 @@ def float_shares_map(snapshot: pd.DataFrame | None) -> dict[str, float]:
 
 
 def idx_on(bars: pd.DataFrame, day: dt.date):
-    """日K序列中某日的下标；无该日（停牌/未上市）返回 None。"""
-    dates = bars["date"].map(_norm_date).tolist()
+    """日K序列中某日的下标；无该日（停牌/未上市）返回 None。
+
+    预判绝大多数查询最新一根日K，先只归一化末行，避免为 3,000+ 股票
+    反复构造整段日期字符串列表；历史查询仍使用原精确匹配口径。
+    """
+    iso = day.isoformat()
+    dates = bars["date"]
+    if len(dates) and _norm_date(dates.iloc[-1]) == iso:
+        return len(dates) - 1
+    normalized = [str(d)[:10] for d in dates.tolist()]
     try:
-        return dates.index(day.isoformat())
+        return normalized.index(iso)
     except ValueError:
         return None
 

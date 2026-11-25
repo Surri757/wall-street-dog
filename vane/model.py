@@ -2,7 +2,7 @@
 """vane 三日自学习模型（口径冻结见 vane/RESEARCH.md，2026-11-22 立项）。
 
 对齐 ziyang 月度模型功能面：walk-forward 训练 / 三日门自动重训 / 坏件自愈 /
-isotonic 校准 / 贡献解释 / 每日微调 / 新旧对照 / 台账 by_version 归因。
+isotonic / Platt 校准 / 贡献解释 / 每日微调 / 新旧对照 / 台账 by_version 归因。
 
 口径（用户拍板 + 调研冻结）：
 - 训练宇宙 = 每日主板非ST封板股中本轮板数 B≥2 的**全体**候选（B 作特征；
@@ -58,20 +58,62 @@ def _load_pools(days: list[dt.date]) -> tuple[dict, list[str]]:
 
 # ---------------------------------------------------------------- 特征行
 
+def _pool_view(days: list[dt.date], pools: dict) -> dict:
+    """预计算窗口共享坐标、涨停日集合与逐日市场/行业统计。
+
+    旧路径对每条候选特征都重建交易日索引、回看整段池历史，并重复扫描当日
+    全池与前三日高度。这里只读聚合一次；特征行仍由 _feature_row 统一产出。
+    """
+    cal = [f"{d:%Y-%m-%d}" for d in days]
+    zt_dates_of: dict[str, list[str]] = {}
+    for iso, day in zip(cal, days):
+        for code in pools.get(day, {}):
+            zt_dates_of.setdefault(code, []).append(iso)
+    daily = []
+    heights = []
+    for idx, day in enumerate(days):
+        pool = pools.get(day, {})
+        height = max((r["lianban"] for r in pool.values()), default=0)
+        heights.append(height)
+        ind_count: dict[str, int] = {}
+        ind_max: dict[str, int] = {}
+        for row in pool.values():
+            ind = row.get("industry") or ""
+            if not ind:
+                continue
+            ind_count[ind] = ind_count.get(ind, 0) + 1
+            ind_max[ind] = max(ind_max.get(ind, 0), row["lianban"])
+        prev_h = [heights[j] for j in range(max(0, idx - 3), idx)
+                  if pools.get(days[j])]
+        daily.append({
+            "mkt_height": height,
+            "mkt_two_plus": sum(1 for r in pool.values() if r["lianban"] >= 2),
+            "ind_count": ind_count, "ind_max": ind_max,
+            "height_trend": height - sum(prev_h) / len(prev_h) if prev_h else None,
+        })
+    return {"cal": cal, "pos": {d: i for i, d in enumerate(cal)},
+            "zt_dates_of": zt_dates_of, "daily": daily}
+
+
 def _round_state(code: str, idx: int, days: list[dt.date],
-                 pools: dict) -> dict:
+                 pools: dict, view: dict | None = None) -> dict:
     """与 engine.streak 同口径的 B/span/breaks（池日集合版）。"""
     from .engine import streak
-    cal = [f"{d:%Y-%m-%d}" for d in days]
-    zt_dates = [cal[i] for i in range(idx + 1) if code in pools[days[i]]]
-    st = streak(zt_dates, cal[idx], cal[:idx + 1], C.MAX_GAP)
+    if view is not None:
+        cal = view["cal"]
+        st = streak(view["zt_dates_of"].get(code, []), cal[idx], cal,
+                    C.MAX_GAP, pos=view["pos"])
+    else:
+        cal = [f"{d:%Y-%m-%d}" for d in days]
+        zt_dates = [cal[i] for i in range(idx + 1) if code in pools[days[i]]]
+        st = streak(zt_dates, cal[idx], cal[:idx + 1], C.MAX_GAP)
     return st or {"B": 0, "span": 0, "breaks": 0}
 
 
 def _feature_row(code: str, prow: dict, idx: int, days: list[dt.date],
-                 pools: dict) -> dict:
+                 pools: dict, view: dict | None = None) -> dict:
     """单候选 (code, T) 的 12 列特征（全 T 收盘可知，纯池口径）。"""
-    st = _round_state(code, idx, days, pools)
+    st = _round_state(code, idx, days, pools, view)
     amount, fund = prow["amount"], prow["fund"]
     seal = (fund / amount) if (fund == fund and amount > 0) else None
     fbt = prow.get("fbt") or ""
@@ -79,11 +121,23 @@ def _feature_row(code: str, prow: dict, idx: int, days: list[dt.date],
     ltsz = _num_or_none(prow.get("ltsz"))
     close = prow.get("close")
     ind = prow.get("industry") or ""
-    pool = pools[days[idx]]
-    mkt_height = max((r["lianban"] for r in pool.values()), default=0)
-    ind_rows = [r for r in pool.values() if ind and r.get("industry") == ind]
-    prev_h = [max((r["lianban"] for r in pools[days[j]].values()), default=0)
-              for j in range(max(0, idx - 3), idx) if pools.get(days[j])]
+    if view is not None:
+        market = view["daily"][idx]
+        mkt_height = market["mkt_height"]
+        mkt_two_plus = market["mkt_two_plus"]
+        ind_zt_count = market["ind_count"].get(ind, 0) if ind else 0
+        ind_max_b = market["ind_max"].get(ind, 0) if ind else 0
+        height_trend = market["height_trend"]
+    else:
+        pool = pools[days[idx]]
+        mkt_height = max((r["lianban"] for r in pool.values()), default=0)
+        ind_rows = [r for r in pool.values() if ind and r.get("industry") == ind]
+        prev_h = [max((r["lianban"] for r in pools[days[j]].values()), default=0)
+                  for j in range(max(0, idx - 3), idx) if pools.get(days[j])]
+        mkt_two_plus = sum(1 for r in pool.values() if r["lianban"] >= 2)
+        ind_zt_count = len(ind_rows)
+        ind_max_b = max((r["lianban"] for r in ind_rows), default=0)
+        height_trend = (mkt_height - sum(prev_h) / len(prev_h)) if prev_h else None
     return {
         "date": f"{days[idx]:%Y-%m-%d}", "code": code,
         "name": prow.get("name", ""), "industry": ind,
@@ -92,11 +146,10 @@ def _feature_row(code: str, prow: dict, idx: int, days: list[dt.date],
         "log_close": math.log10(close) if close and close > 0 else None,
         "log_ltsz": math.log10(ltsz / 1e8) if ltsz and ltsz > 0 else None,
         "mkt_height": mkt_height,
-        "mkt_two_plus": sum(1 for r in pool.values() if r["lianban"] >= 2),
-        "ind_zt_count": len(ind_rows),
-        "ind_max_b": max((r["lianban"] for r in ind_rows), default=0),
-        "height_trend": (mkt_height - sum(prev_h) / len(prev_h))
-                        if prev_h else None,
+        "mkt_two_plus": mkt_two_plus,
+        "ind_zt_count": ind_zt_count,
+        "ind_max_b": ind_max_b,
+        "height_trend": height_trend,
     }
 
 
@@ -122,10 +175,11 @@ def build_samples(trade_date: dt.date, window: int = C.WINDOW):
     if len(days) < 3:
         return [], days, miss
     samples = []
+    view = _pool_view(days, pools)
     for i in range(len(days) - 1):
         nxt = days[i + 1]
         for code, prow in pools[days[i]].items():
-            feat = _feature_row(code, prow, i, days, pools)
+            feat = _feature_row(code, prow, i, days, pools, view)
             if feat["B"] < 2:               # 训练宇宙 = B≥2 全体（用户拍板）
                 continue
             feat["y"] = 1 if code in pools[nxt] else 0
@@ -188,7 +242,10 @@ def _logreg_artifact(meta: dict, med: dict) -> dict:
 # ---------------------------------------------------------------- 训练
 
 def _fit_logreg(X, y, day_keys, sample_weight=None):
-    """logreg 主路径：C 小网格按 leave-one-day-out 对数损失自动选参。
+    """logreg 主路径：LOGREG_GRID 按 leave-one-day-out 对数损失选参。
+
+    Round6 将网格冻结为单一 C=0.5，使生产重训与滚动验证选型一致；保留网格
+    能力供后续有新的独立样本时重新启用。
 
     小样本（~100-150 行）下的「内置迭代优化」——网格/折数都便宜且诚实。
     """
@@ -256,6 +313,23 @@ def _iso_fit(p, y):
         return None
 
 
+def _platt_fit(p, y):
+    """Platt 平滑校准：对原始 logit 拟合一元 Logistic，避免小样本 iso 饱和并列。
+
+    Round6 滚动验证使用同一拟合口径（C=1、无类别再平衡）；只含两个自由参数，
+    比逐阈值保序表更适合当前约 200 行 / 13 个可标注日的样本规模。
+    """
+    from sklearn.linear_model import LogisticRegression
+    p = np.asarray(p, dtype=float)
+    y = np.asarray(y, dtype=int)
+    if len(set(y)) < 2:
+        return None
+    clf = LogisticRegression(C=1.0, max_iter=1000)
+    clf.fit(_logit(p).reshape(-1, 1), y)
+    return {"type": "platt", "coef": float(clf.coef_[0][0]),
+            "intercept": float(clf.intercept_[0]), "backend": "sklearn-logistic-1d"}
+
+
 def train(today: dt.date | None = None) -> dict:
     """滚动窗全量训练（三日门触发/手动调用）。meta.ok=False=样本门不过。"""
     import fstore
@@ -306,7 +380,9 @@ def train(today: dt.date | None = None) -> dict:
         except Exception as e:                 # noqa: BLE001 归档失败留痕不阻断
             meta["prev_archive_error"] = f"{type(e).__name__}: {e}"
     meta["prev_version"] = prev_version
-    if len(samples) >= C.XGB_GATE_N:
+    use_xgb = (C.MODEL_KIND == "xgb"
+               or (C.MODEL_KIND == "auto" and len(samples) >= C.XGB_GATE_N))
+    if use_xgb:
         try:
             booster, backend = _fit_xgb(Xz, y)
         except Exception as e:                 # noqa: BLE001 xgb 不可用回落 logreg
@@ -319,8 +395,10 @@ def train(today: dt.date | None = None) -> dict:
             # 打分都还在用被替换掉的旧模型
             _BOOTER_CACHE.pop(C.MODEL_XGB_JSON, None)
     if meta.get("kind") != "xgb":
-        # 近期权重半衰 7 日（情绪生态滚动适配）；LOD 选参不加权保持稳健
-        age = np.array([(today - dt.date.fromisoformat(k)).days
+        # 近期权重半衰 7 日（情绪生态滚动适配）；锚定最后可标注日而非预测日，
+        # 与 Round6 滚动验证同口径，也避免预测日额外缩放全部样本权重。
+        reference_day = max(dt.date.fromisoformat(k) for k in day_keys)
+        age = np.array([(reference_day - dt.date.fromisoformat(k)).days
                         for k in day_keys], dtype=float)
         w = 0.5 ** (age / 7.0)
         fit = _fit_logreg(Xz, y, day_keys, sample_weight=w)
@@ -328,20 +406,22 @@ def train(today: dt.date | None = None) -> dict:
         fstore.write_text(C.MODEL_LGR_JSON, json.dumps(
             _logreg_artifact({**meta, "mu": mu.tolist(), "sd": sd.tolist()},
                              med), ensure_ascii=False, indent=1))
-    iso = None
+    calibration = None
     try:
-        # 走推理同一条路径出训练集概率：保序表拟合的必须正是日后被打分的东西
-        # （此前 logreg 分支对已标准化的 Xz 再标准化一次）
+        # 校准与推理共用原始概率出口；Platt 使用 logit(P)，iso 使用 P。
         art = (C.MODEL_XGB_JSON if meta["kind"] == "xgb"
                else C.MODEL_LGR_JSON)
-        iso = _iso_fit(_predict_proba(meta, art, X), y)
+        raw_p = _predict_proba(meta, art, X)
+        calibration = (_platt_fit(raw_p, y) if C.CALIBRATION == "platt"
+                       else _iso_fit(raw_p, y))
     except Exception as e:                     # noqa: BLE001 校准失败留痕
         meta["iso_error"] = f"{type(e).__name__}: {e}"
-    meta["iso"] = bool(iso)
-    if iso:
-        fstore.write_text(C.ISO_JSON, json.dumps(iso))
+    meta["calibration"] = calibration.get("type") if calibration else "none"
+    meta["iso"] = bool(calibration)             # 旧字段保留=是否存在校准工件
+    if calibration:
+        fstore.write_text(C.ISO_JSON, json.dumps(calibration))
     elif os.path.exists(C.ISO_JSON):
-        # 新模型没有校准表：旧模型的 iso 绝不能留用（那是按旧分数拟合的映射）
+        # 新模型没有校准表：旧模型的校准绝不能留用（分数分布已变化）
         os.remove(C.ISO_JSON)
     fstore.write_text(C.MODEL_JSON, json.dumps(meta, ensure_ascii=False, indent=1))
     return meta
@@ -395,8 +475,12 @@ def _logit(p):
 
 
 def _iso_apply(p, iso):
+    """应用校准工件；旧断点表为 isotonic，新工件支持 Platt 单变量 Logistic。"""
     if not iso:
         return p
+    if iso.get("type") == "platt":
+        z = float(iso["coef"]) * _logit(p) + float(iso["intercept"])
+        return 1.0 / (1.0 + np.exp(-np.clip(z, -40, 40)))
     return np.interp(p, iso["x"], iso["y"])
 
 
@@ -554,13 +638,14 @@ def apply_ranking(rows: list[dict], trade_date: dt.date,
     # 今日截面特征（pool_raw memo：scan 已拉过的日零网络复用）
     days, _degraded = _window_days(trade_date, C.WINDOW)
     pools, _miss = _load_pools(days)
+    view = _pool_view(days, pools)
     idx = len(days) - 1
     today_pool = pools.get(days[idx], {})
     scores: dict[str, float] = {}
     contribs: dict[str, str] = {}
     codes = [r["code"] for r in rows if r["code"] in today_pool]
     if codes:
-        feats = [_feature_row(c, today_pool[c], idx, days, pools) for c in codes]
+        feats = [_feature_row(c, today_pool[c], idx, days, pools, view) for c in codes]
         X, _ = _matrix(feats, medians=meta.get("medians"))
         art_path = (C.MODEL_XGB_JSON if meta.get("kind") == "xgb"
                     else C.MODEL_LGR_JSON)
@@ -630,6 +715,9 @@ def refit_today(today: dt.date | None = None) -> str:
         fresh = train(today)
         if not fresh.get("ok"):
             return f"微调失败（{fresh.get('reason')}），保留旧件"
+        # train() 已写出全新 meta（coef/样本量/标准化参数）；合并回旧 meta 再盖
+        # 微调标记，避免 MODEL_JSON 与 MODEL_LGR_JSON 字段陈旧不一致。
+        meta = {**meta, **fresh}
         note = f"logreg 重算（{fresh['n_rows']} 行）"
     meta["refit_at"] = f"{today:%Y-%m-%d} {dt.datetime.now():%H:%M:%S}"
     meta["finetuned"] = True
@@ -664,9 +752,10 @@ def retrain_diff(rows: list[dict], today: dt.date | None = None) -> dict | None:
             return None
         days, _ = _window_days(today, C.WINDOW)
         pools, _miss = _load_pools(days)
+        view = _pool_view(days, pools)
         idx = len(days) - 1
         feats = [_feature_row(r["code"], pools[days[idx]][r["code"]], idx,
-                              days, pools)
+                              days, pools, view)
                  for r in rows if r["code"] in pools[days[idx]]]
         X, _ = _matrix(feats, medians=prev_meta.get("medians"))
         # 旧件按原始概率出分、不过保序校准：对照的是模型本身，不混入校准层

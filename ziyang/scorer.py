@@ -28,6 +28,7 @@ import pandas as pd
 import fstore
 
 from . import config as C
+from .seatdata import idx_on
 
 MODEL_DIR = os.path.join(C.DATA_DIR, "model")
 MODEL_JSON = os.path.join(MODEL_DIR, "model.json")
@@ -139,16 +140,12 @@ def market_zt_touch_count(bars_cache: dict, trade_date: dt.date) -> float:
     用 bars_cache 截面近似（~800只主板子样本，与训练口径一致，低估绝对值
     但日间相对可比——特征只用其日间变化信息）。
     """
-    iso = trade_date.isoformat()
     n = 0
     for code, b in bars_cache.items():
         if b is None or not len(b) or str(code)[:3] not in _MB:
             continue
-        dates = b["date"].tolist()
-        if iso not in [str(d)[:10] for d in dates]:
-            continue
-        i = dates.index(next(d for d in dates if str(d)[:10] == iso))
-        if i < 1:
+        i = idx_on(b, trade_date)
+        if i is None or i < 1:
             continue
         hi = float(b["high"].iloc[i])
         prev = float(b["close"].iloc[i - 1])

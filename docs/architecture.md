@@ -155,11 +155,17 @@ F analyze_all（并发）→ second_board 五维评分 → cache_store.save_resu
    不并入「明日决策摘要」、不进明日关注清单统一关注分；全量细节在独立报告
    out/research/vane/report_latest.txt。
    **vane 三日自学习模型**（2026-11-22 立项，口径冻结见 vane/RESEARCH.md）：
-   训练宇宙=B≥2 全体（标签=次日晋级，纯池口径），logreg 主路径 + xgb 门控
-   （n≥120），三日门重训 + 坏件自愈 + 每日微调（不动 trained_at）+
+   训练宇宙=B≥2 全体（标签=次日晋级，纯池口径）；Round6 后冻结为 logreg C=0.5
+   + Platt 平滑校准（auto 模式仍保留 n≥120 的 xgb 门），三日门重训 + 坏件自愈 +
+   每日微调（不动 trained_at）+
    retrain_diff 新旧对照；模型主排 + 启发式 shadow_rank 影子登记，
    台账 model_version 三列 + by_model_version 晋级率 = 「模型 vs 启发式」
    持续实证（先标签后计分）。
+   **vane 换手门槛**（2026-11-25 用户规则，口径见 vane/RESEARCH.md）：本轮（涨停日
+   +断板日）至少 3 个交易日换手 ≥10% 才占名额、不设上限；断板日换手「一天都不
+   可以少」——本地换手库 `out/research/vane/turnover/<日期>.csv` 优先 → 东财日K →
+   新浪日K → baostock → 紫阳日K缓存/近几日快照，在线源整源不可用即本进程熔断，
+   仍缺则在同步摘要里报警；门槛外的票进落选观察并记入 last_scan，主报告区块如实列出。
    **auction/（2026-11-24 立项，research_log 五Z）**：竞价采集旁路子包——外部策略池
    「竞价族」（竞价量 ≥ 昨日量 3% 等）历史不可回补（腾讯分时仅保留近 5 个交易日），
    故每日盘后前向采集。`datasources/auction.py`（`fetch_minute_days`：近 5 个交易日
@@ -202,6 +208,20 @@ F analyze_all（并发）→ second_board 五维评分 → cache_store.save_resu
    - **改签名必查生产调用点**：`model_rank_key` 去参后测试改了、`vane/__init__` 没改，
      TypeError 被 daily_sync 的通配捕获 → 模型主排静默退化为启发式（审查代理抓到）。
      旁路模块的「失败不阻断」通配只许包住取数，不许包住编排本身。
+11. **第四轮性能调优：共享预计算 + 增量窗口，不改策略口径（2026-11-24）。**
+    热点均先记录输入规模、耗时和结果指纹，再做等价重写；`test_round4_optimization_equivalences`
+    常驻覆盖快速路径与原实现逐值一致。
+    - `research_scan.scan_events`：日K数值列一次转成矩阵；有序日期二分区窗，乱序输入保留
+      原过滤顺序。3,049 只股票 / 2,999 事件扫描约 1.30s→1.05s。
+    - `vane.model._pool_view`：交易日索引、个股涨停日、市场高度和行业统计每个窗口只算一次；
+      `engine.streak` 可复用位置索引，旧无缓存调用路径保留。合成 20 日 × 300 股特征基准
+      0.178s→0.020s。
+    - `ziyang.themed._rolling_tag_unions`：按股票维护 Counter 和窗口左界，历史事件只进入/
+      离开窗口一次，替代「日期 × 窗口 × 股票」反复过滤整张事件表。17,672 行特征重建
+      9.12s→1.24s，CSV 指纹不变。
+    - `ziyang.poolmodel._next_bar`：有序日期用 `bisect_right`，21.6 万次调用 0.60s→0.054s；
+      `seatdata.idx_on` 增加最新日快速路径并供 `scorer` / `screen` 复用，最新日市场触板统计
+      约 0.35s→0.04s，历史日仍精确匹配。
 
 ## 模块规模（2026-09-15 更新）
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from bisect import bisect_right
 import math
 import os
 
@@ -53,12 +54,9 @@ def _union_netbuy() -> dict:
 
 
 def _next_bar(S: dict, d: str) -> int | None:
-    """d 之后第一根 K 线下标。"""
-    dates = S["dates"]
-    for i, x in enumerate(dates):
-        if x > d:
-            return i
-    return None
+    """d 之后第一根 K 线下标；日期已升序，二分替代逐行扫描。"""
+    i = bisect_right(S["dates"], d)
+    return i if i < len(S["dates"]) else None
 
 
 # ================================================================ 1. 票池建模

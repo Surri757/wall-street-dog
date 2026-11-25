@@ -27,6 +27,7 @@ import datetime as dt
 import json
 import os
 import pickle
+from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -123,15 +124,25 @@ def scan_events(df: pd.DataFrame, start: dt.date) -> list[dict]:
     need = ["date", "open", "close", "volume"]
     if df is None or len(df) < 12 or not all(c in df.columns for c in need):
         return []
-    d = df[df["date"] >= start].reset_index(drop=True)
-    if len(d) < 8:
+    # 一次取出整块数值矩阵，避免每只股票各做一次 DataFrame 布尔切块、reset_index
+    # 和三列独立 astype。正常日K按日期升序，直接二分窗口起点并切视图；
+    # 非常规乱序输入仍沿用原「过滤但保持原行序」语义。
+    dates_all = list(df["date"])
+    values = df[["open", "close", "volume"]].to_numpy(dtype=float, copy=False)
+    ordered = all(a <= b for a, b in zip(dates_all, dates_all[1:]))
+    if ordered:
+        first = bisect_left(dates_all, start)
+        dates = dates_all[first:]
+        values = values[first:]
+    else:
+        keep = [d >= start for d in dates_all]
+        dates = [d for d, yes in zip(dates_all, keep) if yes]
+        values = values[keep]
+    if len(dates) < 8:
         return []
-    o = d["open"].astype(float).to_numpy()
-    c = d["close"].astype(float).to_numpy()
-    v = d["volume"].astype(float).to_numpy() if "volume" in d.columns else None
-    dates = list(d["date"])
+    o, c, v = values.T
     events = []
-    for i in range(6, len(d) - 1):          # 留5日均量窗口 + 次日交易
+    for i in range(6, len(dates) - 1):      # 留5日均量窗口 + 次日交易
         if c[i - 1] <= 0 or c[i - 2] <= 0 or c[i] < 2:
             continue
         r1 = c[i - 1] / c[i - 2] - 1.0      # 昨日涨停（首板）
@@ -169,13 +180,9 @@ def scan_events(df: pd.DataFrame, start: dt.date) -> list[dict]:
             "ret_oc": float(c[i + 1] / o[i + 1] - 1.0),
             "ret_cc": float(c[i + 1] / c[i] - 1.0),
         }
-        if v is not None:
-            base = v[max(0, i - 5):i].mean()
-            ev["shrink"] = bool(base > 0 and v[i] < base * 0.6)
-            ev["vr"] = round(float(v[i] / base), 2) if base > 0 else None
-        else:
-            ev["shrink"] = False
-            ev["vr"] = None
+        base = v[max(0, i - 5):i].mean()
+        ev["shrink"] = bool(base > 0 and v[i] < base * 0.6)
+        ev["vr"] = round(float(v[i] / base), 2) if base > 0 else None
         events.append(ev)
     return events
 

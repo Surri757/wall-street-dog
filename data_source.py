@@ -17,7 +17,7 @@ from datasources.auction import fetch_minute_days
 from datasources.http import (EM_HEADERS, EM_KLINE_URL, EM_POOL_BASE,
                               EM_SPOT_HOSTS, EM_SPOT_PATH, TX_KLINE_URL)
 from datasources.spot import cache_is_valid, fetch_spot
-from datasources.kline import fetch_daily
+from datasources.kline import fetch_daily, fetch_turnover
 from datasources.pools import (build_candidates_from_pools,
                                fetch_history_pool_candidates, fetch_industry_em,
                                fetch_pool_extras, fill_industry_local, norm_pool_row,

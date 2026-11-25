@@ -2706,13 +2706,19 @@ def test_vane_model_train_score():
         import vane.screen as VS
         T_DAY = dt.date(2026, 11, 13)
         meta = VM.train(T_DAY)
-        assert meta["ok"] and meta["kind"] == "logreg"  # 合成窗口 < xgb 门
+        assert meta["ok"] and meta["kind"] == "logreg"
+        assert meta["calibration"] == "platt" and meta["best_C"] == 0.5
         for k in ("version", "cutoff", "n_rows", "n_pos", "features",
                   "trained_at", "base_rate"):
             assert k in meta, k
         assert os.path.exists(VC.MODEL_JSON)
         assert os.path.exists(VC.MODEL_LGR_JSON)
         assert meta["cutoff"] == "2026-11-12"           # 窗口倒数第二日
+        raw_p = np.array([0.1, 0.5, 0.9])
+        platt = VM._iso_apply(raw_p, {"type": "platt", "coef": 1.2, "intercept": -0.3})
+        assert np.all(np.diff(platt) > 0) and len(np.unique(platt)) == 3
+        legacy_iso = VM._iso_apply(raw_p, {"x": [0.0, 1.0], "y": [0.2, 0.8]})
+        assert np.allclose(legacy_iso, [0.26, 0.5, 0.74])  # 旧校准工件向后兼容
         meta2, note2 = VM.ensure_model(T_DAY)
         assert meta2["ok"] and "复用" in note2           # 三日门：当日训练复用
         built = VS.build_rows(T_DAY)
@@ -2721,6 +2727,7 @@ def test_vane_model_train_score():
                    if int(r["B"]) in VC.BOARD_RANGE)
         scored = [r for r in rows if r.get("model_score") is not None]
         assert scored, "模型分缺失"
+        assert len({round(r["model_score"], 8) for r in scored}) > 1  # Platt 不再饱和同分
         order_key = VM.model_rank_key()
         picks, _ = VS.select(rows, top_n=VC.TOP_N,
                              board_range=VC.BOARD_RANGE, key=order_key)
@@ -3557,7 +3564,265 @@ def test_round3_ziyang_guards():
     print("PASS round3 ziyang guards")
 
 
+def test_round4_optimization_equivalences():
+    """第四轮调优：所有热点重写与原口径逐值等价，且覆盖快速路径边界。"""
+    # 风向标：共享窗口视图 vs 原逐行计算（B/span/市场高度/行业共振/高度趋势）。
+    from vane import model as VM
+    days = [dt.date(2026, 1, 5) + dt.timedelta(days=i) for i in range(7)]
+    codes = ["600001", "600002", "600003", "600004"]
+    pools = {}
+    for i, day in enumerate(days):
+        pools[day] = {}
+        for j, code in enumerate(codes):
+            if j == 0 or (i + j) % 2 == 0:
+                pools[day][code] = {
+                    "code": code, "name": f"票{j}", "amount": 8e7 + j,
+                    "fund": 1.6e8 + j, "fbt": "0931", "ltsz": 5e9 + j,
+                    "close": 12.34 + j, "industry": f"行业{j % 2}",
+                    "lianban": 1 + (i + j) % 5,
+                }
+    view = VM._pool_view(days, pools)
+    for i, day in enumerate(days):
+        for code, prow in pools[day].items():
+            legacy = VM._feature_row(code, prow, i, days, pools)
+            optimized = VM._feature_row(code, prow, i, days, pools, view)
+            assert optimized == legacy, (day, code, optimized, legacy)
+
+    # 题材：Counter 增量滚动窗口 vs 原「整表过滤 + 标签并集」实现。
+    from ziyang import themed as TH
+    ev = pd.DataFrame([
+        {"date": "2026-01-01", "code": "600001", "tags": ["A", "B"]},
+        {"date": "2026-01-01", "code": "600002", "tags": ["B"]},
+        {"date": "2026-01-15", "code": "600001", "tags": ["B", "C"]},
+        {"date": "2026-03-01", "code": "600001", "tags": ["C"]},
+        {"date": "2026-03-01", "code": "600002", "tags": []},
+        {"date": "2026-05-01", "code": "600001", "tags": ["D"]},
+    ])
+    optimized = TH._rolling_tag_unions(ev)
+    expected = {}
+    for d, de in ev.groupby("date", sort=True):
+        for win in TH._WINDOWS:
+            lo = (dt.date.fromisoformat(d) - dt.timedelta(days=win)).isoformat()
+            hist = ev[(ev["date"] >= lo) & (ev["date"] < d)]
+            for code in de["code"]:
+                tags = set()
+                for old_tags in hist.loc[hist["code"] == code, "tags"]:
+                    tags |= set(old_tags)
+                expected[(d, code, win)] = tags
+    assert optimized == expected
+
+    # 日期二分：覆盖首个/中间/缺口/末尾之后，与原线性查找全量一致。
+    from ziyang import poolmodel as PM
+    stock = {"dates": ["2026-01-01", "2026-01-03", "2026-01-08", "2026-02-01"]}
+    probes = ["2025-12-31", "2026-01-01", "2026-01-02", "2026-01-03",
+              "2026-01-07", "2026-02-01", "2026-02-02"]
+    for probe in probes:
+        legacy = next((i for i, d in enumerate(stock["dates"]) if d > probe), None)
+        assert PM._next_bar(stock, probe) == legacy
+
+    # 日K定位：字符串/日期对象混合、最新日快速路径、历史日与缺失日均正确。
+    from ziyang import seatdata as SD
+    from ziyang.scorer import market_zt_touch_count
+    bars = pd.DataFrame({
+        "date": [dt.date(2026, 1, 1), "2026-01-02", "2026-01-05"],
+        "close": [10.0, 10.0, 11.0], "high": [10.5, 10.8, 11.0]})
+    assert SD.idx_on(bars, dt.date(2026, 1, 5)) == 2
+    assert SD.idx_on(bars, dt.date(2026, 1, 2)) == 1
+    assert SD.idx_on(bars, dt.date(2026, 1, 3)) is None
+    assert market_zt_touch_count({"600001": bars}, dt.date(2026, 1, 5)) == 1.0
+    assert market_zt_touch_count({"600001": bars}, dt.date(2026, 1, 2)) == 0.0
+    print("PASS round4 optimization equivalences")
+
+
+def test_vane_turn_gate():
+    """风向标换手门槛（2026-11-25 用户规则）：本轮（涨停日+断板日）至少 3 个交易日
+    换手≥10% 才占名额，不设上限。断板日换手从日K补，只在判定取决于它时才取；
+    取不到的日子记「缺」、不当成 0，也不因此放行。"""
+    import shutil
+    import tempfile
+
+    import data_source as DS
+    import vane
+    import vane.config as VC
+    import vane.engine as VE
+    import vane.ledger as VL
+    import vane.report as VR
+    import vane.screen as VS
+    import vane.turnover as VT
+    from datasources import kline as K
+
+    # ── 1) 纯函数层：门槛外的行永远不占名额，进落选观察 ──
+    rows = [{"code": "600001", "B": 4, "span": 4, "breaks": 0, "seal_ratio": 9.0, "fbt": "0925"},
+            {"code": "600002", "B": 5, "span": 5, "breaks": 0, "seal_ratio": 1.0, "fbt": "0930"}]
+    picks, bench = VE.select([dict(rows[0], turn_ok=False), rows[1]], 3, (4, 5))
+    assert [r["code"] for r in picks] == ["600002"]       # 启发式排第一的 4 连板被挡下
+    assert [r["code"] for r in bench] == ["600001"]
+
+    # ── 2) 编排层：四只 4 板票对照 ──
+    dates = ([dt.date(2026, 11, x) for x in range(2, 7)]
+             + [dt.date(2026, 11, x) for x in range(9, 14)])
+    iso = [d.isoformat() for d in dates]
+
+    def raw(code, name, hs, lb=1):
+        return {"c": code, "n": name, "p": 12340, "zdp": 9.97, "amount": 8e7,
+                "hs": hs, "lbc": lb, "fbt": 93100, "fund": 1.6e8,
+                "hybk": "测试业", "ltsz": 5e9}
+
+    #   甲一 [6,7,8,9] 换手全低（2%）  → 4天4板，高换手 0/4：门槛外
+    #   乙二 [5,6,8,9] 换手 12/11/3/3  → 5天4板断1，已知 2 天，断板日(idx 7)取到 15% → 过线
+    #   丙三 [5,6,8,9] 换手 12/11/3/3  → 同形态，断板日取不到 → 2/5（缺 1 天）：门槛外
+    #   丁四 [6,7,8,9] 换手 20/30/12/5 → 4天4板，高换手 3/4：凭涨停日即过线，不取日K
+    spec = {"600001": ([6, 7, 8, 9], [2.0] * 4, "甲一"),
+            "600002": ([5, 6, 8, 9], [12.0, 11.0, 3.0, 3.0], "乙二"),
+            "600003": ([5, 6, 8, 9], [12.0, 11.0, 3.0, 3.0], "丙三"),
+            "600004": ([6, 7, 8, 9], [20.0, 30.0, 12.0, 5.0], "丁四")}
+    pools: dict = {}
+    for code, (idxs, hss, name) in spec.items():
+        for k, (i, hs) in enumerate(zip(idxs, hss)):
+            pools.setdefault(iso[i], []).append(raw(code, name, hs, k + 1))
+    pools_ymd = {k.replace("-", ""): v for k, v in pools.items()}
+    calls: list = []
+    fake_need: list = []
+
+    def fake_daily_turnover(code, start, end, need=None):
+        calls.append(code)
+        fake_need.append(list(need or []))
+        return {iso[7]: 15.0} if code == "600002" else {}
+
+    keep = (VS.pool_raw, VS.trade_calendar, VS.daily_turnover)
+    VS.trade_calendar = lambda: dates
+    VS.pool_raw = lambda kind, d: (pools_ymd.get(d) if kind == "zt" else [])
+    VS.daily_turnover = fake_daily_turnover
+    try:
+        res = VS.scan(dt.date(2026, 11, 13))
+        assert "error" not in res, res.get("error")
+        by = {r["code"]: r for r in res["rows"]}
+        assert by["600001"]["turn_ok"] is False and by["600001"]["turn_hi"] == 0
+        assert by["600004"]["turn_ok"] is True and by["600004"]["turn_hi"] == 3
+        assert by["600004"]["turn_seq"] == "20.0|30.0|12.0|5.0"
+        assert by["600004"]["turn_max"] == 30.0                 # 不设上限
+        assert by["600002"]["turn_ok"] is True and by["600002"]["turn_hi"] == 3
+        assert by["600002"]["turn_seq"] == "12.0|11.0|15.0|3.0|3.0"   # 断板日补在原位
+        assert by["600003"]["turn_ok"] is False and by["600003"]["turn_miss"] == 1
+        assert by["600003"]["turn_seq"] == "12.0|11.0|—|3.0|3.0"
+        # 只为「有缺日的票」取数，且把缺的是哪几天告诉取数层
+        assert sorted(calls) == ["600002", "600003"]            # 甲一/丁四无缺日，不取
+        assert fake_need == [[iso[7]], [iso[7]]]
+        assert [p["code"] for p in res["picks"]] == ["600004", "600002"]
+        assert [r["code"] for r in res["bench"]] == ["600001", "600003"]
+        assert all(r["turn_ok"] is False for r in res["bench"])
+        # 涨停池各行换手率已写进本地换手库（零网络积累）
+        assert VT._read_day(iso[9]).get("600004") == 5.0
+    finally:
+        VS.pool_raw, VS.trade_calendar, VS.daily_turnover = keep
+
+    # ── 3) 断板日换手取数：在线两源互备、本地库优先、源不可用即熔断、紫阳缓存兜底 ──
+    keep_k = (K._http_get_json, K.ak)
+    K._http_get_json = lambda url, params, **kw: {
+        "klines": ["2026-11-24,1,2,3,4,5,6,7,8,9,1.52", "2026-11-23,1,2,3,4,5,6,7,8,9,-"]}
+
+    def _boom(*a, **k):
+        raise ConnectionError("Remote end closed connection without response")
+
+    class _FakeAK:
+        @staticmethod
+        def stock_zh_a_daily(symbol, start_date, end_date, adjust):
+            return pd.DataFrame({"date": ["2026-11-20", "2026-11-23", "2026-11-24"],
+                                 "turnover": [0.139449, float("nan"), 0.103789]})
+    try:
+        assert K.fetch_turnover("600001", dt.date(2026, 11, 20),
+                                dt.date(2026, 11, 24)) == {"2026-11-24": 1.52}
+        K._http_get_json, K.ak = _boom, _FakeAK             # 东财断连 → 新浪自带换手率
+        got = K.fetch_turnover("603030", dt.date(2026, 11, 20), dt.date(2026, 11, 24))
+        assert {d: round(v, 4) for d, v in got.items()} == {
+            "2026-11-20": 13.9449, "2026-11-24": 10.3789}   # 缺失日不进结果
+    finally:
+        K._http_get_json, K.ak = keep_k
+
+    tmp2 = tempfile.mkdtemp()
+    keep = (DS.fetch_turnover, VT._baostock_turnover, VC.TURNOVER_DIR, VT._ZIYANG_BARS)
+    VC.TURNOVER_DIR = os.path.join(tmp2, "turnover")
+    VT._MEMO.clear()
+    VT._DEAD.clear()
+    net: list = []
+
+    def fake_online(code, s, e):
+        net.append(code)
+        return {"2026-11-10": 12.0}
+    DS.fetch_turnover = fake_online
+    VT._baostock_turnover = lambda code, s, e: {}
+    d10, d11, d12 = (dt.date(2026, 11, x) for x in (10, 11, 12))
+    try:
+        VT.record("2026-11-11", {"600009": 3.5, "600010": None})   # 非数值不写
+        VT.record("2026-11-11", {"600009": 4.5})                    # 幂等合并
+        assert VT._read_day("2026-11-11") == {"600009": 4.5}
+        assert VT.daily_turnover("600009", d10, d12, ["2026-11-11"]) == {"2026-11-11": 4.5}
+        assert net == []                                             # 本地有 → 不联网
+        got = VT.daily_turnover("600009", d10, d12, ["2026-11-10", "2026-11-11"])
+        assert got == {"2026-11-10": 12.0, "2026-11-11": 4.5} and net == ["600009"]
+        assert VT._read_day("2026-11-10") == {"600009": 12.0}        # 取到即入库
+        VT._MEMO.clear()
+        VT.daily_turnover("600009", d10, d12, ["2026-11-10"])
+        assert net == ["600009"]                                     # 第二次走本地
+        DS.fetch_turnover = lambda code, s, e: {}                    # 在线、baostock 全挂
+        VT._ZIYANG_BARS = {"600777": pd.DataFrame({"date": ["2026-11-12"], "turnover": [7.25]})}
+        VT._MEMO.clear()
+        VT._DEAD.clear()
+        for code in ("600888", "600999"):
+            assert VT.daily_turnover(code, d12, d12, ["2026-11-12"]) == {}
+        assert VT._DEAD == {"online", "baostock"}                    # 整源不可用只试一次
+        assert VT.daily_turnover("600777", d12, d12, ["2026-11-12"]) == {"2026-11-12": 7.25}
+        for day in ("2026-11-01", "2026-11-02", "2026-11-03"):
+            VT.record(day, {"600009": 1.0})
+        VT.prune(keep=4)
+        files = sorted(os.listdir(VC.TURNOVER_DIR))
+        assert len(files) == 4 and files[0] == "2026-11-03.csv"
+    finally:
+        DS.fetch_turnover, VT._baostock_turnover, VC.TURNOVER_DIR, VT._ZIYANG_BARS = keep
+        VT._MEMO.clear()
+        VT._DEAD.clear()
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+    # ── 4) 台账留痕 + 主报告区块 + 独立报告 ──
+    tmp = tempfile.mkdtemp()
+    keep = (VC.LEDGER_CSV, VC.LAST_SCAN_JSON, VC.REPORT_TXT)
+    VC.LEDGER_CSV = os.path.join(tmp, "ledger.csv")
+    VC.LAST_SCAN_JSON = os.path.join(tmp, "last_scan.json")
+    VC.REPORT_TXT = os.path.join(tmp, "report.txt")
+    try:
+        day = dt.date(2026, 11, 13)
+        picks = [dict(r, rank=i + 1, group="4to5") for i, r in enumerate(res["picks"])]
+        assert "登记 2 条" in VL.register(day, picks, regen_same_day=False)
+        got = {r["code"]: r for r in VL.rows_for(day)}
+        assert got["600002"]["turn_hi"] == "3" and got["600002"]["turn_days"] == "5"
+        assert got["600002"]["turn_seq"] == "12.0|11.0|15.0|3.0|3.0"
+        VL.mark_scanned(day, 2, 0, gated=[{"code": "600003", "name": "丙三",
+                                           "label": "5天4板断1", "B": 4,
+                                           "turn_hi": 2, "turn_days": 5, "turn_miss": 1}])
+        assert VL.scanned_on(day)["gated"][0]["code"] == "600003"
+        lines = vane.section_lines(day)
+        txt = "\n".join(lines)
+        assert "高换手 3/4 天" in txt and "高换手 3/5 天" in txt
+        assert "换手门槛外" in txt and "600003 丙三" in txt and "2/5 天" in txt
+        assert not any("600001" in ln for ln in lines)     # 只列 last_scan 里登记的门槛外票
+        out = VR.render(res)
+        assert "换手门槛：本轮（涨停日+断板日）至少 3 个交易日换手" in out
+        assert "▎换手门槛外" in out and "600001 甲一" in out
+        assert "本轮换手% 20.0→30.0→12.0→5.0" in out
+    finally:
+        VC.LEDGER_CSV, VC.LAST_SCAN_JSON, VC.REPORT_TXT = keep
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS vane turn gate")
+
+
 if __name__ == "__main__":
+    # 风向标取数的离线隔离（全程有效）：本地换手库指到临时目录，断板日换手的补取
+    # 不打网络——个别测试会自己再打补丁，还原时落回这里的桩
+    import tempfile as _tf
+    import vane.config as _VC
+    import vane.screen as _VS
+    _VC.TURNOVER_DIR = _tf.mkdtemp(prefix="zc_vane_turn_")
+    _VS.daily_turnover = lambda *a, **k: {}
     test_main_board()
     test_limit_prices()
     test_build_candidates()
@@ -3629,6 +3894,8 @@ if __name__ == "__main__":
     test_round3_auction_report_gates()
     test_round3_vane_model_space()
     test_round3_ziyang_guards()
+    test_round4_optimization_equivalences()
+    test_vane_turn_gate()
     test_trade_rules()
     test_mood_stages()
     test_concept_boards_parse()

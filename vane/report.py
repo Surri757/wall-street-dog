@@ -28,8 +28,17 @@ def _fbt_hhmm(v: str) -> str:
     return f"{v[:2]}:{v[2:]}" if v else "—"
 
 
+def _turn_line(r: dict) -> str:
+    """本轮逐日换手（首板→今日，含断板日；%）与高换手天数。"""
+    seq = "→".join(str(r.get("turn_seq") or "").split("|"))
+    miss = r.get("turn_miss") or 0
+    return (f"     本轮换手% {seq}｜≥{C.TURN_GATE_PCT:g}% {r.get('turn_hi')}"
+            f"/{r.get('turn_days')} 天"
+            + (f"（{miss} 天缺数据未计）" if miss else ""))
+
+
 def _pick_line(r: dict) -> list[str]:
-    """单个名额两行：概要行 + 板链行。"""
+    """单个名额三行：概要行 + 板链行 + 本轮换手行。"""
     head = (f"  #{r['rank']} {r['code']} {r['name']:<8} {r['label']}"
             f"(晋{r['B'] + 1})  封成比{_fmt_seal(r.get('seal_ratio'))}"
             f" · {_fbt_hhmm(r.get('fbt') or '')}封"
@@ -37,7 +46,8 @@ def _pick_line(r: dict) -> list[str]:
             + (f" · {r['industry']}" if r.get("industry") else ""))
     # ISO 日期取 [5:] → "MM-DD"；板链直观展示断板分布
     chain = "→".join(x[5:] for x in r["round_dates"])
-    return [head, f"     板链 {chain}"]
+    return [head, f"     板链 {chain}",
+            _turn_line(r) if r.get("turn_days") else ""]
 
 
 def render(result: dict) -> str:
@@ -51,6 +61,8 @@ def render(result: dict) -> str:
         "─" * RULE_W,
         f"口径：明晋5(4板)与明晋6(5板)合并取前{C.TOP_N}｜板=收盘封板｜同轮断板间隔"
         f"≤{C.MAX_GAP}个交易日｜仅主板非ST",
+        f"换手门槛：本轮（涨停日+断板日）至少 {C.TURN_GATE_DAYS} 个交易日换手"
+        f"≥{C.TURN_GATE_PCT:g}% 才占名额，不设上限",
         ("排序：模型主排（三日模型）｜影子=板高 > 断板少 > 跨度紧凑 > 封成比"
          if meta else
          "排序：板高 > 断板少 > 跨度紧凑 > 封成比 > 封板时间（启发式）"),
@@ -68,23 +80,48 @@ def render(result: dict) -> str:
         lines.append(f"  模型: 未启用（{result.get('model_note') or '样本门未过'}）"
                      "——启发式排序（shadow_rank 已登记供对照）")
     picks = result["picks"]
+    gated_out = [r for r in result["bench"] if r.get("turn_ok") is False]
+    bench = [r for r in result["bench"] if r.get("turn_ok") is not False]
     if not picks:
-        lines.append("  （今日无 4板/5板 晋级候选——空间断层或情绪冰点，如实空缺）")
+        lines.append(
+            f"  （今日 {len(gated_out)} 只 4板/5板 候选全部在换手门槛外——"
+            "如实空缺，不拿门槛外的票凑数）" if gated_out else
+            "  （今日无 4板/5板 晋级候选——空间断层或情绪冰点，如实空缺）")
     for r in picks:
-        lines += _pick_line(r)
+        lines += [ln for ln in _pick_line(r) if ln]
         if r.get("model_score") is not None:
             lines.append(f"     模型分 {r['model_score']:+.2f}"
                          + (f"（score100 {r.get('score100')}｜贡献 {r.get('contribs')}）"
                             if r.get("contribs") else "")
                          + f"  影子#{r.get('shadow_rank', '—')}")
-    if result["bench"]:
+    if gated_out:
+        lines.append("")
+        lines.append(f"▎换手门槛外（本轮换手≥{C.TURN_GATE_PCT:g}% 不足 "
+                     f"{C.TURN_GATE_DAYS} 天 · 不占名额）")
+        for r in gated_out:
+            lines.append(f"  · {r['code']} {r['name']:<8} {r['label']}"
+                         f"(晋{r['B'] + 1})  高换手 {r.get('turn_hi')}/"
+                         f"{r.get('turn_days')} 天"
+                         + (f"（{r['turn_miss']} 天缺数据）" if r.get("turn_miss") else ""))
+    if bench:
         lines.append("")
         lines.append("▎落选观察（已入围但名额已满）")
-        for r in result["bench"][:6]:
+        for r in bench[:6]:
             lines.append(f"  · {r['code']} {r['name']:<8} {r['label']}"
                          f"(晋{r['B'] + 1})  封成比{_fmt_seal(r.get('seal_ratio'))}")
-        if len(result["bench"]) > 6:
-            lines.append(f"  …另有 {len(result['bench']) - 6} 只")
+        if len(bench) > 6:
+            lines.append(f"  …另有 {len(bench) - 6} 只")
+    # premium11 影子对照（只读 result 内字段；无影子结果则整节省略）
+    ps = result.get("premium_shadow")
+    if ps:
+        layer = "SCREENING(proxy open-open)" if ps.get("screening") else ps.get("layer")
+        lines.append("")
+        lines.append(f"▎溢价影子（premium11 · 不切生产）· 层 {layer} · 状态 {ps.get('status')}")
+        a_s = ", ".join(ps.get("A_top3") or []) or "无可用模型分"
+        b1_s = ", ".join(ps.get("B1_top3") or [])
+        b0_s = ", ".join(ps.get("B0_top3") or [])
+        lines.append(f"  A(新溢价) {a_s}｜B1(旧晋级) {b1_s}｜B0(启发式) {b0_s}"
+                     f"｜重合 A·B1 {ps.get('overlap_A_B1', 0)}｜B2 等权 {ps.get('B2_n', 0)} 只")
     ladder = result.get("ladder") or {}
     if ladder:
         lad_s = "｜".join(f"{b}板×{n}" for b, n in ladder.items())

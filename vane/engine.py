@@ -18,7 +18,7 @@ from __future__ import annotations
 
 
 def streak(zt_dates: list[str], today: str, cal_dates: list[str],
-           max_gap: int) -> dict | None:
+           max_gap: int, *, pos: dict[str, int] | None = None) -> dict | None:
     """回溯个股「本轮板数」。
 
     zt_dates  该票窗口内全部涨停日（ISO 串，乱序/重复均可，只取 ≤ today 的部分）
@@ -30,7 +30,7 @@ def streak(zt_dates: list[str], today: str, cal_dates: list[str],
           "breaks": 断板次数, "round_dates": 本轮涨停日(旧→新)}；
     今日不在涨停日集合或不在交易日坐标内时返回 None。
     """
-    pos = {d: i for i, d in enumerate(cal_dates)}
+    pos = pos if pos is not None else {d: i for i, d in enumerate(cal_dates)}
     if today not in pos:
         return None
     zs = sorted({d for d in zt_dates if d in pos and d <= today}, reverse=True)
@@ -65,15 +65,20 @@ def sort_key(r: dict) -> tuple:
 
 def select(rows: list[dict], top_n: int,
            board_range: tuple, key=None) -> tuple[list[dict], list[dict]]:
-    """入围 + 排序 + 名额截断。
+    """入围 + 换手门槛 + 排序 + 名额截断。
 
     key 缺省=启发式 sort_key（板高>断板>跨度>封成比）；模型主排时传入
     model.model_rank_key（分高优先、启发式兜底保确定性）。
-    返回 (picks 占名额的前 top_n, bench 同样入围但名额已满的落选观察)。
+    换手门槛（2026-11-25）：行上 turn_ok=False 的不占名额——用户的口径是
+    「本轮高换手天数不足的没有参与必要」，所以它排在一切之后，进落选观察。
+    没有 turn_ok 字段的行（旧数据/非 4、5 板组）按不设门槛处理。
+    返回 (picks 占名额的前 top_n, bench 落选观察：名额已满的在前、门槛外的在后)。
     """
-    qual = [r for r in rows if int(r.get("B") or 0) in board_range]
+    in_range = [r for r in rows if int(r.get("B") or 0) in board_range]
+    gated_out = [r for r in in_range if r.get("turn_ok") is False]
+    qual = [r for r in in_range if r.get("turn_ok") is not False]
     qual.sort(key=key or sort_key)
-    return qual[:top_n], qual[top_n:]
+    return qual[:top_n], qual[top_n:] + sorted(gated_out, key=sort_key)
 
 
 def label(r: dict) -> str:

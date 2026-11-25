@@ -26,7 +26,10 @@ LEDGER_COLS = ["date", "rank", "code", "name", "group", "label", "B", "span",
                "breaks", "seal_ratio", "fbt", "industry", "close",
                "model_version", "model_score", "shadow_rank", "score100",
                "round_dates",
-               "status", "verify_date", "promoted", "next_pct", "note"]
+               "status", "verify_date", "promoted", "next_pct", "note",
+               # 换手门槛留痕（2026-11-25）：本轮交易日数 / 换手≥10% 天数 /
+               # 单日最高换手% / 逐日换手%（"|" 分隔，缺=—）
+               "turn_days", "turn_hi", "turn_max", "turn_seq"]
 
 # 晋级判定阈值（百分数口径，来源 config.PROMOTE_APPROX 单一事实源）
 _PROMOTE_PCT = C.PROMOTE_APPROX * 100.0
@@ -78,17 +81,23 @@ def register(trade_date: dt.date, picks: list[dict],
             "round_dates": "|".join(p.get("round_dates") or []),
             "status": "pending", "verify_date": "", "promoted": "",
             "next_pct": "", "note": "",
+            "turn_days": p.get("turn_days", ""), "turn_hi": p.get("turn_hi", ""),
+            "turn_max": p.get("turn_max", ""), "turn_seq": p.get("turn_seq", ""),
         })
     ledger.sort(key=lambda r: (r["date"], str(r["rank"]).zfill(2)))
     _save(ledger)
     return f"{trade_date} 登记 {len(picks)} 条风向标"
 
 
-def mark_scanned(trade_date: dt.date, n_picks: int, miss_days: int) -> None:
-    """scan 跑过即留痕（区分「今日无候选」与「模块没跑」；section_lines 依据）。"""
+def mark_scanned(trade_date: dt.date, n_picks: int, miss_days: int,
+                 gated: list | None = None) -> None:
+    """scan 跑过即留痕（区分「今日无候选」与「模块没跑」；section_lines 依据）。
+
+    gated：被换手门槛挡下的候选摘要列表，供主报告区块如实展示「谁被挡、为什么」。
+    """
     mark = {"date": trade_date.isoformat(), "n_picks": n_picks,
-            "miss_days": miss_days}
-    fstore.write_text(C.LAST_SCAN_JSON, json.dumps(mark))
+            "miss_days": miss_days, "gated": gated or []}
+    fstore.write_text(C.LAST_SCAN_JSON, json.dumps(mark, ensure_ascii=False))
 
 
 def scanned_on(trade_date: dt.date) -> dict | None:

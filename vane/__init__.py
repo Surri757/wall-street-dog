@@ -90,14 +90,34 @@ def daily_sync(trade_date: dt.date | None = None,
     for i, r in enumerate(picks, 1):
         r["rank"] = i
         r["group"] = f"{r['B']}to{r['B'] + 1}"
+    # 换手门槛留痕：过线数/入围数；被挡下的候选记进 last_scan，主报告区块如实展示
+    in_range = [r for r in rows if int(r.get("B") or 0) in C.BOARD_RANGE]
+    n_pass = sum(1 for r in in_range if r.get("turn_ok") is not False)
+    gated = [{"code": r["code"], "name": r["name"], "label": r["label"],
+              "B": r["B"], "turn_hi": r.get("turn_hi"),
+              "turn_days": r.get("turn_days"), "turn_miss": r.get("turn_miss", 0)}
+             for r in bench if r.get("turn_ok") is False]
     result = dict(built, picks=picks, bench=bench, model_meta=meta,
                   model_note=mnote)
 
-    # 3) 登记（含 model_version/model_score/shadow_rank 归因列）+ 留痕 + 报告
+    # 3) 登记（含 model_version/model_score/shadow_rank/换手统计 归因列）+ 留痕
     rmsg = ledger.register(trade_date, picks, regen_same_day=True)
     ledger.mark_scanned(trade_date, len(picks),
-                        len(result.get("miss_days") or []))
+                        len(result.get("miss_days") or []), gated=gated)
+
+    # 3b) premium11 溢价影子对照：独立工件/台账，只出影子榜；任何失败留痕，
+    #     不阻断旧晋级模型主排与后续微调。须在 report.render 前挂入 result，
+    #     影子区块才能随主报告落盘。
+    try:
+        from . import premium_model
+        premium = premium_model.daily_shadow(trade_date, rows, meta)
+        result["premium_shadow"] = premium
+    except Exception as e:                     # noqa: BLE001 影子链路失败隔离
+        print(f"[风向标] 溢价影子异常（{type(e).__name__}: {e}），不影响旧链路")
+        result["premium_shadow"] = {"status": f"shadow_error:{type(e).__name__}"}
+
     report.render(result)
+
     try:
         if meta:
             from . import model
@@ -120,8 +140,15 @@ def daily_sync(trade_date: dt.date | None = None,
     lad_s = "｜".join(f"{b}板×{n}" for b, n in list(lad.items())[:3])
     m_s = (f"｜模型 {meta.get('version')}·{mnote}" if meta
            else f"｜{mnote}")
+    ps = result.get("premium_shadow") or {}
+    p_s = (f"｜溢价影子 {ps.get('status')}"
+           + ("·SCREENING" if ps.get("screening") else "")) if ps.get("status") else ""
+    # 断板日换手率取不到 = 该票可能被误挡：必须大声说出来，不能淹没在明细里
+    lack = [f"{r['name']}×{r['turn_miss']}天" for r in in_range if r.get("turn_miss")]
+    l_s = f"｜⚠换手缺数据（该票按已知天数判定，稍后重跑可补）：{'、'.join(lack)}" if lack else ""
     return (f"风向标同步：名额 {len(picks)}/{C.TOP_N}"
-            f"｜梯队 {lad_s or '无2板+'}｜{m_s}｜{fmsg}｜{rmsg}")
+            f"｜换手门槛 {n_pass}/{len(in_range)}"
+            f"｜梯队 {lad_s or '无2板+'}｜{m_s}｜{fmsg}｜{rmsg}{p_s}{l_s}")
 
 
 def section_lines(trade_date: dt.date) -> list[str]:
@@ -137,7 +164,10 @@ def section_lines(trade_date: dt.date) -> list[str]:
     """
     import termstyle as T
 
+    from . import config as C
     from . import ledger
+
+    C_TURN_DAYS, C_TURN_PCT = C.TURN_GATE_DAYS, C.TURN_GATE_PCT
 
     def _seal(v) -> str:
         try:
@@ -162,7 +192,8 @@ def section_lines(trade_date: dt.date) -> list[str]:
         return T.stars3(0 if s >= 66.7 else (1 if s >= 33.4 else 2))
 
     rows = ledger.rows_for(trade_date)
-    if not rows and not ledger.scanned_on(trade_date):
+    mark = ledger.scanned_on(trade_date)
+    if not rows and not mark:
         return []
     lines = [
         T.bold("▎情绪风向标（4板晋5 / 5板晋6 · 三名额 · 明日晋级观察）"),
@@ -201,8 +232,19 @@ def section_lines(trade_date: dt.date) -> list[str]:
         detail = f"封成比{_seal(r['seal_ratio'])} · {_fbt(r['fbt'])}封"
         if r.get("industry"):
             detail += f" · {r['industry']}"
+        if r.get("turn_days"):
+            detail += f" ｜ 高换手 {r['turn_hi']}/{r['turn_days']} 天"
         lines.append(f"     {detail}"
                      + (f" ｜ 板链 {chain_s}" if chain_s else ""))
+    # 被换手门槛挡下的候选：如实列出（用户看得出「谁被挡、为什么」，也知道不是漏了）
+    gated = (mark or {}).get("gated") or []
+    if gated:
+        lines.append(T.dim("  换手门槛外（本轮换手≥"
+                           f"{C_TURN_PCT:g}% 不足 {C_TURN_DAYS} 天，不占名额）："))
+        for g in gated:
+            miss = f"·{g['turn_miss']} 天缺数据" if g.get("turn_miss") else ""
+            lines.append(T.dim(f"    {g['code']} {g['name']} {g['label']}"
+                               f"（高换手 {g.get('turn_hi')}/{g.get('turn_days')} 天{miss}）"))
     s = ledger.summary()
     if s.get("n"):
         rate = s.get("promote_rate")

@@ -169,8 +169,7 @@ def build_universe(snapshot: pd.DataFrame | None, bars_cache: dict,
         for code, b in bars_cache.items():
             if b is None or not len(b) or str(code)[:3] not in C.MAIN_BOARD_PREFIXES:
                 continue
-            dates = b["date"].tolist()
-            i = dates.index(iso) if iso in [str(d)[:10] for d in dates] else None
+            i = idx_on(b, trade_date)
             if i is None or i < 5:
                 continue
             c = b["close"]
@@ -188,11 +187,8 @@ def build_universe(snapshot: pd.DataFrame | None, bars_cache: dict,
     for code, b in bars_cache.items():
         if b is None or not len(b) or str(code)[:3] not in C.MAIN_BOARD_PREFIXES:
             continue
-        dates = [str(d)[:10] for d in b["date"].tolist()]
-        if iso not in dates:
-            continue
-        i = dates.index(iso)
-        if i < 6:
+        i = idx_on(b, trade_date)
+        if i is None or i < 6:
             continue
         c = b["close"]
         if (float(c.iloc[i]) / float(c.iloc[i - 5]) - 1.0) * 100.0 >= C.CANDIDATE_M5_MIN:

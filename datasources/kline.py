@@ -2,6 +2,7 @@
 """个股日K：东财直连 → 腾讯直连 → 新浪（节流）三源降级；含熔断与增量取数。"""
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import threading
 import time
@@ -43,6 +44,43 @@ def _daily_em_direct(code: str, end_date: dt.date) -> pd.DataFrame:
     return _finalize_bars(pd.DataFrame(rows))
 
 
+def _turnover_em(code: str, start: dt.date, end: dt.date) -> dict:
+    """东财日K 的 f61 字段（与 _daily_em_direct 同一端点、同一套表头）。"""
+    params = {
+        "secid": to_secid(code),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101", "fqt": "1",
+        "beg": start.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d"),
+    }
+    try:
+        data = _http_get_json(EM_KLINE_URL, params,
+                              referer=f"https://quote.eastmoney.com/{code}.html",
+                              retries=1)
+    except Exception:                          # noqa: BLE001 补充字段：失败即空
+        return {}
+    out: dict = {}
+    for line in data.get("klines") or []:
+        p = str(line).split(",")
+        if len(p) >= 11:
+            try:
+                out[p[0]] = float(p[10])
+            except ValueError:                 # 停牌日等 "-" 占位
+                continue
+    return out
+
+
+def fetch_turnover(code: str, start: dt.date, end: dt.date) -> dict:
+    """个股区间内每日换手率（百分数）→ {"YYYY-MM-DD": 换手率}；取不到返回 {}。
+
+    两源互备：东财日K → 新浪日K。东财会整晚主动断连（2026-11-25 实测，编号主机
+    亦然），新浪是主流程日K降级链一直在用的源；两源数值逐日一致（同日实测全筑
+    股份 11-20 / 11-23：13.9% / 15.8%）。只服务少数几只票的补充字段，不重试，
+    失败返回空由调用方继续降级。
+    """
+    return _turnover_em(code, start, end) or _turnover_sina(code, start, end)
+
+
 def _daily_tx_direct(code: str, end_date: dt.date) -> pd.DataFrame:
     """直连腾讯日K（前复权），列序: date, open, close, high, low, ..."""
     symbol = to_tx_symbol(code)
@@ -66,13 +104,13 @@ _SINA_LOCK = threading.Lock()  # 新浪日K大量抓取易封 IP：串行 + 节�
 _SINA_CALL_TIMEOUT = 20.0      # 秒：akshare 内部请求不带超时，靠外层兜底挂死
 
 
-def _daily_sina(code: str, end_date: dt.date) -> pd.DataFrame:
-    if ak is None:
-        raise ImportError("akshare 未安装")
-    symbol = to_tx_symbol(code)
-    start = end_date - dt.timedelta(days=HISTORY_DAYS)
-    # 锁与请求都限时：此前在持锁状态下调用无超时的 akshare，连接一悬挂，
-    # 锁永不释放，8 个工作线程全部卡死在 acquire 上
+@contextlib.contextmanager
+def _sina_guard():
+    """调 akshare 新浪接口时的锁与超时保护（日K、换手率共用）。
+
+    锁与请求都限时：此前在持锁状态下调用无超时的 akshare，连接一悬挂，
+    锁永不释放，8 个工作线程全部卡死在 acquire 上。
+    """
     if not _SINA_LOCK.acquire(timeout=_SINA_CALL_TIMEOUT):
         raise TimeoutError("新浪日K源忙（上一请求未返回），跳过")
     try:
@@ -82,19 +120,53 @@ def _daily_sina(code: str, end_date: dt.date) -> pd.DataFrame:
         # 临时生效，finally 恢复，不改宿主进程的全局默认
         socket.setdefaulttimeout(_SINA_CALL_TIMEOUT)
         try:
-            raw = ak.stock_zh_a_daily(symbol=symbol,
-                                      start_date=start.strftime("%Y%m%d"),
-                                      end_date=end_date.strftime("%Y%m%d"),
-                                      adjust="qfq")
+            yield
         finally:
             socket.setdefaulttimeout(prev)
-        time.sleep(0.2)  # 节流，避免触发新浪封 IP
     finally:
         _SINA_LOCK.release()
+
+
+def _daily_sina(code: str, end_date: dt.date) -> pd.DataFrame:
+    if ak is None:
+        raise ImportError("akshare 未安装")
+    symbol = to_tx_symbol(code)
+    start = end_date - dt.timedelta(days=HISTORY_DAYS)
+    with _sina_guard():
+        raw = ak.stock_zh_a_daily(symbol=symbol,
+                                  start_date=start.strftime("%Y%m%d"),
+                                  end_date=end_date.strftime("%Y%m%d"),
+                                  adjust="qfq")
+        time.sleep(0.2)  # 节流，避免触发新浪封 IP
     if isinstance(raw, pd.DataFrame) and "volume" in raw.columns:
         # 新浪日K成交量单位是股，东财/腾讯是手：统一为手（跨源拼接/比值才一致）
         raw["volume"] = pd.to_numeric(raw["volume"], errors="coerce") / 100.0
     return _finalize_bars(raw)
+
+
+def _turnover_sina(code: str, start: dt.date, end: dt.date) -> dict:
+    """新浪日K 的换手率列（=成交量/流通股本，小数口径）→ {date: %}；失败 {}。"""
+    if ak is None:
+        return {}
+    try:
+        with _sina_guard():
+            raw = ak.stock_zh_a_daily(symbol=to_tx_symbol(code),
+                                      start_date=start.strftime("%Y%m%d"),
+                                      end_date=end.strftime("%Y%m%d"), adjust="")
+            time.sleep(0.2)
+    except Exception:                          # noqa: BLE001 节流/封锁/解析失败即空
+        return {}
+    if not isinstance(raw, pd.DataFrame) or "turnover" not in raw.columns:
+        return {}
+    out: dict = {}
+    for d, v in zip(raw["date"], raw["turnover"]):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if v == v:
+            out[str(d)[:10]] = 100.0 * v
+    return out
 
 
 def _finalize_bars(raw: Optional[pd.DataFrame]) -> pd.DataFrame:

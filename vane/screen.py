@@ -17,7 +17,9 @@ import datetime as dt
 from data_source import parse_pool, pool_raw, trade_calendar
 
 from . import config as C
+from . import turnover
 from .engine import label, select, streak
+from .turnover import daily_turnover
 
 
 def _is_main_board(code: str) -> bool:
@@ -33,6 +35,42 @@ def _num_or_none(v) -> float | None:
 
 def _ymd(d: dt.date) -> str:
     return f"{d:%Y%m%d}"
+
+
+def _turn_stats(code: str, st: dict, cal_str: list[str],
+                zt_by_day: dict) -> dict:
+    """本轮换手统计（换手门槛，口径见 vane.config.TURN_GATE_*）。
+
+    本轮交易日 = 首板日到今日的全部交易日（涨停日 + 断板日）。涨停日取当日涨停池行
+    的换手率；其余日子（断板日，以及池行缺换手的涨停日）向 daily_turnover 补取
+    ——**每一天的换手都要补齐**，哪怕凭已知天数就已过线（逐日序列要完整给用户看；
+    取数顺序见 vane.turnover：本地库优先、多源互备）。实在取不到的日子记为「缺」，
+    不当成 0：turn_ok 按已知天数判定，turn_miss 如实留痕并报警。
+
+    返回 turn_days（本轮交易日数）/ turn_hi（换手≥门槛的天数）/ turn_miss（缺数据
+    天数）/ turn_max（本轮单日最高换手%）/ turn_seq（逐日换手%，"|" 分隔，缺=—）
+    / turn_ok（是否过门槛）。
+    """
+    board = set(st["round_dates"])
+    days = cal_str[cal_str.index(st["round_dates"][0]):
+                   cal_str.index(st["round_dates"][-1]) + 1]
+    seq: list[float | None] = []
+    for d in days:
+        row = zt_by_day.get(d, {}).get(code) if d in board else None
+        t = _num_or_none(row["turnover"]) if row is not None else None
+        seq.append(100.0 * t if t is not None else None)
+    lack = [d for t, d in zip(seq, days) if t is None]
+    if lack:
+        got = daily_turnover(code, dt.date.fromisoformat(days[0]),
+                             dt.date.fromisoformat(days[-1]), lack)
+        seq = [t if t is not None else got.get(d) for t, d in zip(seq, days)]
+    known = [t for t in seq if t is not None]
+    n_hi = sum(1 for t in known if t >= C.TURN_GATE_PCT)
+    return {"turn_days": len(days), "turn_hi": n_hi,
+            "turn_miss": len(seq) - len(known),
+            "turn_max": round(max(known), 1) if known else None,
+            "turn_seq": "|".join("—" if t is None else f"{t:.1f}" for t in seq),
+            "turn_ok": n_hi >= C.TURN_GATE_DAYS}
 
 
 def _window_days(trade_date: dt.date, window: int) -> tuple[list[dt.date], bool]:
@@ -92,6 +130,13 @@ def build_rows(trade_date: dt.date, window: int = C.WINDOW) -> dict:
     today_pool = zt_by_day.get(today_iso)
     if today_pool is None:
         return {"error": f"{today_iso} 涨停池拉取失败，本次筛选放弃（明日重跑）"}
+    # 本地换手库：把已经拿到的换手率存下来（涨停池各行 + 当日全市场快照，都是
+    # 现成的数据）——以后任何一天先查本地，不再看接口当天的脸色
+    for iso_d, pool in zt_by_day.items():
+        turnover.record(iso_d, {c: 100.0 * t for c, r in pool.items()
+                                if (t := _num_or_none(r["turnover"])) is not None})
+    turnover.record_snapshot(today_iso)
+    turnover.prune()
 
     zt_dates_of: dict[str, list[str]] = {}           # code → 窗口内涨停日
     for iso, pool in zt_by_day.items():
@@ -111,7 +156,7 @@ def build_rows(trade_date: dt.date, window: int = C.WINDOW) -> dict:
             continue
         amount = prow["amount"]
         fund = prow["fund"]
-        rows.append({
+        row = {
             "code": code, "name": prow["name"],
             "B": st["B"], "span": st["span"], "breaks": st["breaks"],
             "round_dates": st["round_dates"], "label": label(st),
@@ -120,7 +165,11 @@ def build_rows(trade_date: dt.date, window: int = C.WINDOW) -> dict:
             "ltsz": _num_or_none(prow["ltsz"]),
             "seal_ratio": (round(fund / amount, 2)
                            if fund == fund and amount > 0 else None),
-        })
+        }
+        # 换手门槛只对占名额的板数组（4/5 板）算；其余板数组不涉及，不白花请求
+        if st["B"] in C.BOARD_RANGE:
+            row.update(_turn_stats(code, st, cal_str, zt_by_day))
+        rows.append(row)
         if st["B"] >= 2:
             ladder[st["B"]] = ladder.get(st["B"], 0) + 1
 
